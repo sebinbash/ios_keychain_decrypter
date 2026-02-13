@@ -44,13 +44,14 @@ import time
 # can be found in /private/var/Keychains/keychain-2.db
 KEYCHAIN_DEFAULT_PAHT = "keychain-2.db"
 
+KEY_CLASS_MAP = {}
 
 # itemv7 is encoded with protobuf.
 # definition taken from Apple Open Source (Security/keychain/securityd)
 # https://opensource.apple.com/source/Security/Security-59306.80.4/keychain/securityd/
 def deserialize_data(rowitem):
 	version = unpack('<L', rowitem['data'][0:4])[0]
-	if version == 7:
+	if version == 7 or version == 8:
 		root = SecDbKeychainSerializedItemV7_pb2.SecDbKeychainSerializedItemV7()
 		item = root.FromString(rowitem['data'][4:])
 		rowitem['keyclass'] = item.keyclass
@@ -76,6 +77,7 @@ def deserialize_data(rowitem):
 # sshpass -p alpine scp -P2222 -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no keyclass_unwrapper root@127.0.0.1:  
 def unwrap_key(key, keyclass):
 	if keyclass >=6 :
+		print("unwrapping key", key.hex(), "of class", int(keyclass))
 		ssh = subprocess.Popen([
 				"sshpass",
 				"-p",
@@ -86,9 +88,9 @@ def unwrap_key(key, keyclass):
 				"UserKnownHostsFile=/dev/null", 
 				"-o", 
 				"StrictHostKeyChecking=no", 
-				"root@127.0.0.1",
+				"mobile@localhost",
 				"./keyclass_unwrapper",
-				hexlify(key).decode("ascii"),
+				key.hex(),
 				str(int(keyclass))
 			],
 			shell=False,
@@ -98,11 +100,12 @@ def unwrap_key(key, keyclass):
 		out = ssh.stdout.readlines()
 		while out == 0:
 			out = ssh.stdout.readlines()
-			time.sleep(1)
+			time.sleep(0.1)
 		if len(out) > 0:
+			print("unwrapped key", key.hex(), "of class", int(keyclass))
 			unwrapped_key = out[0]
 		else: 
-			print ("error unwrapping key of keyclass {}: {} \n Trying again...".format(keyclass, hexlify(key)))
+			print ("error unwrapping key of keyclass {}: {} \n Trying again...".format(int(keyclass), key.hex()))
 			unwrapped_key = unwrap_key(key, keyclass)
 			
 	return unwrapped_key
@@ -117,7 +120,15 @@ def unwrap_key(key, keyclass):
 # - parsing resulting ASN1 DER
 def decrypt_secretData(item):
 	if item['keyclass'] >=6 :
-		unwrapped_key = unwrap_key(item['encryptedSecretData_wrappedKey'], item['keyclass'])
+		stored_key = KEY_CLASS_MAP.get(item['keyclass'], {}).get(item['encryptedSecretData_wrappedKey'].hex())
+		if stored_key:
+			print("found stored key")
+			unwrapped_key = stored_key
+		else:
+			unwrapped_key = unwrap_key(item['encryptedSecretData_wrappedKey'], item['keyclass'])
+			if not KEY_CLASS_MAP.get(item['keyclass']):
+				KEY_CLASS_MAP[item['keyclass']] = {}
+			KEY_CLASS_MAP[item['keyclass']][item['encryptedSecretData_wrappedKey'].hex()] = unwrapped_key
 		bplist = BytesIO(item['encryptedSecretData_ciphertext'])
 		plist = ccl_bplist.load(bplist)
 		secretDataDeserialized = ccl_bplist.deserialise_NsKeyedArchiver(plist, parse_whole_structure=True)
@@ -150,10 +161,19 @@ def decrypt_Metadata(item, df_meta):
 		authCode = metaDataWrappedKeyDeserialized['root']['SFAuthenticationCode']
 		iv   = metaDataWrappedKeyDeserialized['root']['SFInitializationVector']
 		ciphertext = metaDataWrappedKeyDeserialized['root']['SFCiphertext']
-		unwrapped_metadata_key = unwrap_key(
-			df_meta[df_meta.keyclass == int(item['keyclass'])].iloc[0].data, 
-			item['keyclass']
-			)
+		key = df_meta[df_meta.keyclass == int(item['keyclass'])].iloc[0].data
+		stored_key = KEY_CLASS_MAP.get(item['keyclass'], {}).get(key.hex())
+		if stored_key:
+			print("found stored key")
+			unwrapped_metadata_key = stored_key
+		else:
+			unwrapped_metadata_key = unwrap_key(
+				df_meta[df_meta.keyclass == int(item['keyclass'])].iloc[0].data, 
+				item['keyclass']
+				)
+		if not KEY_CLASS_MAP.get(item['keyclass']):
+			KEY_CLASS_MAP[item['keyclass']] = {}
+		KEY_CLASS_MAP[item['keyclass']][key.hex()] = unwrapped_metadata_key
 		gcm = AES.new(unhexlify(unwrapped_metadata_key)[:32], AES.MODE_GCM, iv)
 		metadata_key = gcm.decrypt_and_verify(ciphertext, authCode)
 
@@ -200,6 +220,18 @@ def main():
 	SELECT * FROM inet;
 	""", db)
 
+	# extract data from certificate table
+	df_cert = pandas.read_sql_query(
+	"""
+	SELECT * FROM cert;
+	""", db)
+
+	# extract data from keys table
+	df_keys = pandas.read_sql_query(
+	"""
+	SELECT * FROM keys;
+	""", db)
+
 
 	# extract metadata class keys to decrypt metadata
 	df_meta = pandas.read_sql_query(
@@ -218,9 +250,19 @@ def main():
 	df_inet = df_inet.apply(lambda r: decrypt_Metadata(r, df_meta), axis=1)
 	df_inet = df_inet.apply(lambda r: decrypt_secretData(r), axis=1)
 
+	df_cert = df_cert.apply(lambda r: deserialize_data(r), axis=1)
+	df_cert = df_cert.apply(lambda r: decrypt_Metadata(r, df_meta), axis=1)
+	df_cert = df_cert.apply(lambda r: decrypt_secretData(r), axis=1)
+
+	df_keys = df_keys.apply(lambda r: deserialize_data(r), axis=1)
+	df_keys = df_keys.apply(lambda r: decrypt_Metadata(r, df_meta), axis=1)
+	df_keys = df_keys.apply(lambda r: decrypt_secretData(r), axis=1)
+
 	res_dict = {
 		'genp': df_genp['decrypted'].to_list(),
-		'inet': df_inet['decrypted'].to_list()
+		'inet': df_inet['decrypted'].to_list(),
+		'cert': df_cert['decrypted'].to_list(),
+		'keys': df_keys['decrypted'].to_list(),
 	}
 	
 
@@ -230,7 +272,5 @@ def main():
 		plistlib.dump(res_dict, out, sort_keys=False )
 
 if __name__ == "__main__":
-    main()
+	main()
 
-
-	    
